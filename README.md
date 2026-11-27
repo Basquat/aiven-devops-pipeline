@@ -1,392 +1,267 @@
-# Pipeline DevOps — Dashboard + Aiven.io (100% navegador, sem instalação local)
+# Pipeline DevOps — Dashboard + Aiven.io
 
-Laboratório completo: um dashboard Flask que mostra métricas de acesso,
-com dados persistidos em um **PostgreSQL gerenciado pela Aiven.io**, e um
-pipeline de CI/CD em **GitHub Actions** que:
+Laboratório de Cloud Computing & DevOps: um dashboard Flask com indicadores
+econômicos do Banco Central, dados guardados num **PostgreSQL gerenciado pela
+Aiven.io**, e um pipeline de CI/CD no **GitHub Actions** que:
 
-1. Provisiona a infraestrutura na Aiven via **Terraform** (rodando no runner do GitHub, não na máquina do aluno).
-2. Testa e builda a aplicação.
-3. Publica a imagem Docker no GitHub Container Registry (GHCR).
-4. Dispara o deploy da aplicação no **Render** (plataforma com deploy via hook HTTP, sem CLI local).
+1. Provisiona o Postgres na Aiven via **Terraform** (rodando no runner do GitHub).
+2. Roda lint e testes da aplicação contra um Postgres descartável.
+3. Builda e publica a imagem Docker no GitHub Container Registry (GHCR).
+4. Dispara o deploy no **Render** e só fica verde quando a versão nova está no ar.
 
-Todo o fluxo é feito pela interface web do GitHub, da Aiven e do Render —
-nenhuma ferramenta local é necessária, compatível com ambientes de sala de
-aula sem permissão de instalação.
+Tudo pelo navegador (GitHub, Aiven e Render), sem instalar nada na máquina.
 
-## Estrutura do repositório
+Esta versão cobre só o **laboratório básico**. Kafka e Grafana foram tirados
+porque são pagos na Aiven (ver [Mudanças em relação ao original](#mudanças-em-relação-ao-original)).
+
+## Estrutura
 
 ```
-aiven-devops-pipeline/
-├── Dockerfile               # Builda a partir da raiz do repo, copia de app/
-├── app/                    # Aplicação Flask (o dashboard)
-│   ├── app.py
-│   ├── bcb_client.py       # Conexão com Postgres (pool) + client da API do BCB
+├── Dockerfile               # fica na raiz, copia de app/ (ver Troubleshooting 1)
+├── app/
+│   ├── app.py               # rotas Flask: /, /api/indicators, /api/refresh, /healthz
+│   ├── bcb_client.py        # pool de conexões com o Postgres + client da API do BCB
+│   ├── test_app.py          # testes (rodam no CI com Postgres em container)
 │   ├── requirements.txt
 │   ├── .env.example
 │   ├── templates/dashboard.html
 │   └── static/style.css
-├── terraform/               # Provisionamento da infra na Aiven
-│   ├── main.tf
-│   ├── variables.tf
-│   └── outputs.tf
+├── terraform/               # Postgres na Aiven (plano free)
 └── .github/workflows/
-    ├── infra.yml            # Provisiona o Postgres na Aiven
-    └── ci-cd.yml             # Testa, builda, publica e faz deploy do app
+    ├── infra.yml            # Terraform (manual)
+    ├── ci-cd.yml            # test → build/push → deploy
+    └── refresh-data.yml     # atualiza os dados do BCB a cada 6h
 ```
 
-> **Nota:** o `Dockerfile` fica na **raiz** do repositório (não em `app/`),
-> mesmo a aplicação estando na pasta `app/`. Isso é proposital — ver
-> [Troubleshooting](#troubleshooting--problemas-comuns-no-deploy) abaixo
-> para o motivo.
+## Passo a passo
 
-## Passo a passo (tudo pelo navegador)
+Segue as 10 etapas do guia do professor, com os ajustes que este código precisa.
 
-### 1. Criar o repositório no GitHub
-- Crie um repositório novo e envie estes arquivos (pode usar o próprio
-  editor web do GitHub: **Add file → Upload files**).
+### 1. Conta e projeto na Aiven
+Crie a conta em [aiven.io](https://aiven.io) e um **Project** (ex.: `turma-devops-2026`).
+Anote o nome exato.
 
-### 2. Criar a conta e o projeto na Aiven
-- Acesse [aiven.io](https://aiven.io) e crie uma conta (tem free trial/plano gratuito para estudo).
-- Crie um **Project** no console da Aiven — anote o nome do projeto.
-- Vá em **Profile → Authentication tokens** e gere um **API token**.
+### 2. Token de API
+Avatar → **Profile → Authentication tokens → Generate token**. Copie na hora,
+ele não aparece de novo.
 
-### 3. Configurar os Secrets do repositório no GitHub
-Em **Settings → Secrets and variables → Actions → New repository secret**,
-crie:
+### 3. Repositório no GitHub
+Faça um fork deste repositório ou suba os arquivos num repositório seu.
+A aba **Actions** deve listar os workflows.
 
-| Secret | Descrição |
+### 4. Secrets
+Em **Settings → Secrets and variables → Actions → New repository secret**:
+
+| Secret | Valor |
 |---|---|
-| `AIVEN_API_TOKEN` | Token gerado no passo 2 |
-| `AIVEN_PROJECT` | Nome do projeto na Aiven |
-| `RENDER_DEPLOY_HOOK_URL` | Deploy hook do serviço no Render (passo 5) |
-| `APP_HEALTHCHECK_URL` | URL pública do app no Render, ex: `https://seu-app.onrender.com` |
-| `AIVEN_DB_URL` | Service URI do Postgres (necessária no job de consumer em lote) |
-| `KAFKA_BOOTSTRAP_SERVERS` | Saída `kafka_bootstrap_servers` do Terraform |
-| `KAFKA_USERNAME` | Saída `kafka_username` do Terraform |
-| `KAFKA_PASSWORD` | Saída `kafka_password` do Terraform |
-| `KAFKA_CA_CERT_PEM` | Saída `kafka_ca_cert` do Terraform (cole o certificado inteiro) |
-| `KAFKA_TOPIC` | `bcb-indicadores` (ou o valor de `kafka_topic_name`) |
+| `AIVEN_API_TOKEN` | token da etapa 2 |
+| `AIVEN_PROJECT` | nome do projeto da etapa 1 |
+| `RENDER_DEPLOY_HOOK_URL` | deploy hook do Render (etapa 8) |
+| `APP_HEALTHCHECK_URL` | URL pública do app, ex.: `https://seu-app.onrender.com` (sem `/` no final) |
 
-Os 5 secrets de Kafka só são necessários se você for usar a extensão de
-streaming (seção [Streaming com Kafka](#streaming-com-kafka) abaixo) — o
-laboratório básico funciona só com os 4 primeiros.
+Enquanto os dois últimos estiverem vazios, o pipeline não falha: ele pula o
+deploy com um aviso.
 
-### 4. Provisionar o banco na Aiven
-- Vá na aba **Actions** do repositório e rode manualmente o workflow
-  **"Infra - Provisionar Aiven (Terraform)"** (botão *Run workflow*).
-- Isso cria um serviço PostgreSQL gerenciado na Aiven. Acompanhe o
-  progresso e a URI de conexão no console da Aiven
-  (**Services → dashboard-pg → Connection information**).
+### 5. Provisionar o Postgres
+**Actions → Infra - Provisionar Aiven (Terraform) → Run workflow.**
+Quando terminar, no console da Aiven: **Services → dashboard-pg**, status
+*Running*. Em **Connection information**, copie a **Service URI**.
 
-### 5. Criar o serviço no Render (deploy do app)
-- Crie uma conta em [render.com](https://render.com).
-- **New → Web Service → Build and deploy from a Git repository**, aponte
-  para o repositório.
-- Em **Settings**, confirme (valores padrão, não precisa mexer se o
-  `Dockerfile` estiver na raiz do repo como neste projeto):
-  - **Root Directory**: vazio.
-  - **Dockerfile Path**: `./Dockerfile`.
-  - **Docker Build Context Directory**: `.`.
-- Em **Environment**, adicione:
-  - `AIVEN_DB_URL` — a string de conexão copiada do console da Aiven.
-  - `PORT` — **`8080`**, criada manualmente (o Render às vezes não detecta
-    sozinho a porta exposta pelo container; ver
-    [Troubleshooting](#troubleshooting--problemas-comuns-no-deploy)).
-- Em **Settings → Deploy Hook**, copie a URL e cole no secret
-  `RENDER_DEPLOY_HOOK_URL` do GitHub (passo 3).
+O plano usado é o `free-1-1gb` (gratuito). **Não troque por `hobbyist`**: ele é
+cobrado. Pode rodar o workflow de novo sem medo: ele reconhece o serviço que já
+existe em vez de tentar criar outro.
 
-### 6. Rodar o pipeline de CI/CD
-- Qualquer `push` na pasta `app/` na branch `main` dispara o workflow
-  **"CI/CD - Dashboard App"**, que:
-  1. Roda lint e um smoke test de import.
-  2. Builda e publica a imagem em `ghcr.io/<usuário>/<repo>/dashboard-app`.
-  3. Chama o deploy hook do Render.
-  4. Verifica `/healthz` após o deploy.
+### 6. Serviço no Render
+[render.com](https://render.com) → **New → Web Service** → conecte o repositório.
 
-### 7. Acessar o dashboard
-- Abra a URL pública do Render — o dashboard mostra visitas totais,
-  uptime, um gráfico (Chart.js) de acessos por minuto e os últimos
-  acessos registrados, tudo lido do Postgres da Aiven.
+- **Runtime**: Docker
+- **Root Directory**: **vazio** (o guia em PDF diz `app`, mas aqui o Dockerfile
+  fica na raiz e com `app` o build quebra)
+- **Instance type**: Free
 
-## Fonte de dados: dados abertos do Banco Central (SGS)
+### 7. Variáveis de ambiente no Render
+Em **Environment**:
 
-O dashboard consome a **API de Dados Abertos do Banco Central do Brasil**
-([dadosabertos.bcb.gov.br](https://dadosabertos.bcb.gov.br/)) — pública,
-sem necessidade de chave ou cadastro. Por padrão, três séries do SGS
-(Sistema Gerenciador de Séries Temporais) são exibidas:
+- `AIVEN_DB_URL`: a Service URI da etapa 5.
+- `PORT`: `8080` (opcional, o container escuta na porta que o Render mandar).
+
+Crie o serviço, espere o primeiro deploy e copie a URL pública para o secret
+`APP_HEALTHCHECK_URL`.
+
+Duas configurações que valem a pena em **Settings**:
+
+- **Health Check Path** = `/healthz`. O Render só troca para a versão nova se
+  ela responder ok, então um deploy quebrado não derruba o site.
+- **Auto-Deploy** = **Off**. Assim só o pipeline faz deploy, e só depois dos
+  testes passarem. Com Auto-Deploy ligado, cada push faz dois deploys (o
+  automático e o do hook) e código que quebrou no teste vai para o ar do mesmo jeito.
+
+### 8. Deploy hook
+No Render, **Settings → Deploy Hook**: copie a URL para o secret
+`RENDER_DEPLOY_HOOK_URL`.
+
+### 9. Rodar o CI/CD
+Qualquer push em `app/` na `main` dispara o **CI/CD - Dashboard App**. Também
+dá para rodar pelo botão *Run workflow*. Os três jobs:
+
+1. **test**: flake8 e `test_app.py` contra um Postgres 16 em container.
+2. **build-and-push**: imagem em `ghcr.io/<usuário>/<repo>/dashboard-app`.
+3. **deploy**: chama o hook e consulta `/healthz` até ele responder com o
+   commit do push (até 10 min, o free tier do Render é lento para subir).
+
+Em pull request só roda o `test`.
+
+### 10. Validar
+Abra a URL pública. A página recarrega sozinha a cada 10 s, e cada carga conta
+como um acesso:
+
+- card "Acessos ao dashboard" aumentando;
+- gráfico de acessos por minuto (últimos 30 min);
+- tabela "Últimos acessos";
+- cards e gráfico com dólar, Selic e IPCA.
+
+## Fonte de dados: Banco Central (SGS)
+
+API pública, sem chave: [dadosabertos.bcb.gov.br](https://dadosabertos.bcb.gov.br/).
 
 | Código | Indicador | Unidade |
 |---|---|---|
 | 1 | Dólar comercial (venda) | R$ |
-| 432 | Meta Selic definida pelo Copom | % a.a. |
+| 432 | Meta Selic (Copom) | % a.a. |
 | 433 | IPCA — variação mensal | % |
 
-### Como funciona o cache
+Cada série fica em cache na tabela `bcb_series`. A cada visita o app confere se
+o cache tem mais de `CACHE_HOURS` (padrão 6h) e só então busca na API. Se a API
+do BCB cair, o app continua mostrando o último dado salvo. Para trocar ou
+adicionar séries, edite o dicionário `SERIES` em `bcb_client.py` (catálogo em
+[www3.bcb.gov.br/sgspub](https://www3.bcb.gov.br/sgspub)).
 
-Chamar a API do BCB a cada carregamento da página seria lento e
-desnecessário (os dados mudam no máximo uma vez por dia). Por isso:
+## Variáveis de ambiente
 
-1. Cada série é salva na tabela `bcb_series` do Postgres da Aiven
-   (`series_code`, `ref_date`, `value`, `fetched_at`).
-2. A cada requisição ao dashboard, o app confere se o cache de cada série
-   tem mais de `CACHE_HOURS` (padrão: 6h). Se sim, busca dados novos na API
-   do BCB e faz um `UPSERT`; se não, usa o que já está no banco.
-3. Se a API do BCB estiver fora do ar, o app **não quebra** — continua
-   servindo os últimos dados em cache e registra um aviso no log.
-4. Opcionalmente, o workflow `.github/workflows/refresh-data.yml` chama
-   `POST /api/refresh` a cada 6h via `cron`, mantendo o cache quente mesmo
-   sem visitas — configure o secret `APP_HEALTHCHECK_URL` (o mesmo já usado
-   no health check) para habilitá-lo.
-
-### Trocando a fonte de dados
-
-O padrão de `app.py` (`SERIES`, `fetch_series_from_bcb`, `bcb_series`) foi
-escrito para ser fácil de adaptar a outras APIs de dados abertos do governo:
-
-- **Outras séries do próprio BCB**: basta adicionar entradas ao dicionário
-  `SERIES` com o código da série (consulte o
-  [catálogo do SGS](https://www3.bcb.gov.br/sgspub)).
-- **IBGE (SIDRA/localidades)**: trocar `fetch_series_from_bcb` por uma
-  chamada a `https://servicodados.ibge.gov.br/api/v1/...` — o formato de
-  resposta é diferente, então o parsing precisa ser ajustado, mas a
-  estrutura de cache (tabela, `is_cache_stale`, `upsert`) pode ser reaproveitada.
-- **Portal da Transparência**: requer cadastro de token gratuito
-  ([api.portaldatransparencia.gov.br](https://api.portaldatransparencia.gov.br/)),
-  que deve ser adicionado como um novo secret/variável de ambiente.
-
-## Streaming com Kafka
-
-Extensão opcional que transforma a ingestão de "polling batelado" (o app
-busca dados sozinho, de tempos em tempos) em **arquitetura orientada a
-eventos**: um *producer* publica os dados novos do BCB num tópico Kafka, e
-um *consumer* — dissociado do app — assina esse tópico e grava no mesmo
-Postgres. O dashboard Flask não muda nada na leitura.
-
-```
-GitHub Actions (cron 15min)          Kafka (Aiven)              Consumer
-┌────────────────┐   publica    ┌──────────────────┐  assina  ┌──────────┐
-│  producer.py    │ ───────────▶ │ bcb-indicadores  │ ───────▶ │consumer.py│
-│ busca no BCB    │              │     (tópico)     │          │ grava no  │
-└────────────────┘               └──────────────────┘          │ Postgres  │
-                                                                  └──────────┘
-```
-
-**Atenção de custo:** ao contrário do Postgres (plano `hobbyist`, gratuito
-em contas elegíveis), o Aiven for Apache Kafka normalmente exige um plano
-pago (`startup-2` por padrão no Terraform). Confirme disponibilidade e
-custo na sua conta antes de rodar o `terraform apply`.
-
-### Onde o consumer roda
-
-O `consumer.py` foi escrito para funcionar dos dois jeitos, ao mesmo tempo
-se você quiser (ambos compartilham o mesmo `KAFKA_GROUP_ID`, então o Kafka
-nunca entrega a mesma mensagem duas vezes):
-
-1. **Worker contínuo no Render** — sempre escutando o tópico:
-   - No Render, crie um novo serviço **Background Worker** (não Web
-     Service), apontando para o mesmo repositório/Dockerfile.
-   - Em **Settings → Docker Command**, sobrescreva o comando padrão para
-     `python consumer.py`.
-   - Configure as mesmas variáveis de ambiente do app (`AIVEN_DB_URL`) mais
-     as 5 variáveis de Kafka (mesmos valores dos secrets do GitHub).
-
-2. **Job em lote no GitHub Actions** — `.github/workflows/kafka-consume-batch.yml`,
-   roda a cada 20 min por 30 segundos e sai. Funciona como **rede de
-   segurança**: se o worker do Render cair ou dormir, os dados não ficam
-   represados por muito tempo.
-
-Para o producer, o workflow `.github/workflows/kafka-produce.yml` já cuida
-de tudo — roda a cada 15 min, sem precisar de nenhum serviço always-on.
-
-### Testando manualmente
-
-Pelo botão **Run workflow** na aba Actions, você pode disparar o
-`Kafka - Producer` manualmente e depois checar no Grafana (ou direto no
-Postgres, via PG Studio) se o `fetched_at` da tabela `bcb_series` mudou.
-
-## Exploração com Grafana
-
-Além do dashboard Flask "caseiro", o Terraform provisiona um serviço
-**Aiven for Grafana**, para explorar os mesmos dados visualmente, sem
-escrever código:
-
-1. Depois do `terraform apply`, acesse a saída `grafana_uri` (ou o console
-   da Aiven → serviço `bcb-grafana` → Overview) para pegar a URL e as
-   credenciais de acesso.
-2. Em **Connections → Data sources → Add data source → PostgreSQL**,
-   preencha host/porta/usuário/senha do serviço `dashboard-pg` (mesmas
-   informações de **Connection information** no console da Aiven).
-3. Crie um painel apontando para a tabela `bcb_series` — por exemplo, uma
-   série temporal filtrando por `series_code`.
-
-Isso deixa nítida, em aula, a diferença entre um dashboard sob medida
-(controle total do código, mais trabalho) e um dashboard gerenciado
-(configuração via UI, menos código).
-
-## Variáveis de ambiente da aplicação
-
-Veja `app/.env.example`. Em produção (Render), são configuradas na aba
-**Environment** do serviço — nunca commitadas no repositório.
-
-| Variável | Obrigatória? | Descrição |
+| Variável | Obrigatória | Descrição |
 |---|---|---|
-| `AIVEN_DB_URL` | Sim | String de conexão do Postgres, copiada do console da Aiven |
-| `PORT` | Sim, no Render | `8080` — precisa bater com o `--bind` do `CMD` no Dockerfile (ver [Troubleshooting](#troubleshooting--problemas-comuns-no-deploy), item 8) |
-| `CACHE_HOURS` | Não | Horas antes de buscar dados novos na API do BCB (padrão: 6) |
+| `AIVEN_DB_URL` | sim | Service URI do Postgres da Aiven |
+| `PORT` | não | porta HTTP (padrão 8080; o Render define a dele) |
+| `CACHE_HOURS` | não | horas de cache das séries do BCB (padrão 6) |
+| `TZ_DISPLAY` | não | fuso usado nos horários de acesso (padrão `America/Sao_Paulo`) |
+| `DB_SSLMODE` | não | só para teste local/CI (`disable`); em produção fica `require` |
 
-## Diagrama do pipeline
+## Rodando os testes local (opcional)
 
-```
- GitHub (push)
-      │
-      ▼
- ┌───────────────┐        ┌──────────────────────┐
- │ infra.yml     │        │ ci-cd.yml            │
- │ Terraform     │        │ test → build → push  │
- │ → PG + Kafka  │        │ imagem (GHCR)         │
- │   + Grafana   │        └──────────┬───────────┘
- └──────┬────────┘                   │
-        │                            ▼
-        ▼                     Render (deploy hook)
-  Aiven.io (PostgreSQL               │
-  gerenciado, SSL)                   ▼
-        ▲               App Flask (dashboard) ── lê ──▶ Aiven for Grafana
-        │                            ▲
-        │ upsert            AIVEN_DB_URL
-        │
-  consumer.py ◀── assina ── bcb-indicadores ◀── publica ── producer.py
-  (Render worker                (Kafka)              (GH Actions, cron 15min)
-   ou GH Actions --once)
+Precisa de um Postgres local, por exemplo com Docker:
+
+```bash
+docker run -d --name pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:16
+cd app
+pip install -r requirements.txt
+AIVEN_DB_URL=postgres://postgres:postgres@localhost:5432/postgres DB_SSLMODE=disable \
+  python -m unittest -v test_app
 ```
 
-## Troubleshooting — problemas comuns no deploy
+## Mudanças em relação ao original
 
-Esta seção documenta os problemas reais enfrentados ao colocar este
-projeto no ar pela primeira vez no Render, na ordem em que costumam
-aparecer. Se o seu deploy estiver falhando, comece por aqui.
+- **Kafka e Grafana removidos** (Terraform, `producer.py`, `consumer.py`,
+  `kafka_common.py` e os dois workflows). Ficam pagos na Aiven e não fazem
+  parte do lab básico. Estão no primeiro commit do histórico se alguém quiser
+  fazer a extensão.
+- **Plano do Postgres**: `hobbyist` → `free-1-1gb`. O `hobbyist` é cobrado. Saíram
+  também o `aiven_pg_database` e o `aiven_pg_user`, que o app não usava (ele
+  conecta com o `avnadmin` no `defaultdb` da Service URI).
+- **infra.yml**: só manual, confere os secrets antes e importa o serviço se já
+  existir. Antes, rodar duas vezes dava erro de "already exists", porque o state
+  do Terraform some no fim de cada job.
+- **Bug no gráfico**: a consulta das séries usava `ORDER BY ref_date ASC LIMIT 30`,
+  ou seja, pegava os 30 pontos **mais antigos** da tabela. Como a tabela só
+  cresce, com o tempo o dashboard parava de mostrar o dado atual. Agora pega os
+  mais recentes.
+- **Dashboard**: gráfico de acessos por minuto, tabela de últimos acessos e
+  recarga a cada 10 s, como pede a etapa 10 do guia. As séries viraram um
+  gráfico cada: antes as três dividiam o eixo de datas do dólar, então o IPCA
+  (mensal) aparecia em datas erradas e, se o dólar falhasse, o gráfico sumia todo.
+- **IPCA com só 3 pontos**: a busca pegava os últimos `30 × 3` dias, o que
+  numa série mensal dá 3 meses. Séries mensais agora buscam 30 meses.
+- **API do BCB instável**: às vezes ela derruba a conexão sem motivo (aconteceu
+  testando). As chamadas agora tentam de novo até 3 vezes antes de desistir.
+- **Testes de verdade no CI**: antes era só `py_compile` e o flake8 com
+  `--exit-zero` (nunca falhava). Agora o flake8 reprova e o `test_app.py` roda
+  contra um Postgres em container, com a API do BCB simulada.
+- **Deploy confiável**: o `sleep 45` + um `curl` passava mesmo com a versão
+  antiga no ar. Agora o `/healthz` devolve o commit (`RENDER_GIT_COMMIT`) e o job
+  espera a versão certa. Sem os secrets do Render o deploy é pulado com aviso.
+  Também tem `workflow_dispatch`, `concurrency` e cache de pip e de camadas Docker.
+- **Dockerfile**: roda como usuário sem privilégio, escuta em `$PORT` (acaba com
+  o problema de porta do item 8 do Troubleshooting), logs sem buffer e
+  `--threads 4` para uma requisição lenta não travar as outras.
+- **/healthz** não devolve mais a mensagem de erro do banco para quem acessa
+  (ela mostrava host e usuário). O detalhe vai para o log do Render.
+- `.gitignore` e `.dockerignore` adicionados.
 
-### 1. Build falha em `COPY requirements.txt .` / `not found`
+## Troubleshooting
+
+Problemas reais de quando o projeto foi colocado no ar pela primeira vez.
+
+**1. Build falha em `COPY requirements.txt .` / `not found`.**
+O Dockerfile estava em `app/` e o contexto de build do Render era a raiz. Por
+isso ele foi movido para a raiz, com `COPY app/...`. Deixe o **Root Directory vazio**.
+
+**2. `COPY` ou `import` falha mesmo com o arquivo "lá".**
+Confira se o nome não tem espaço sobrando (já aconteceu com ` requirements.txt`
+e com o `bcb_client.py`, ao renomear pelo editor web do GitHub). Para
+diagnosticar, um `RUN find . -maxdepth 3 -not -path '*/.git*'` temporário no
+Dockerfile mostra o que chegou no build.
+
+**3. `relation "..." does not exist`.**
+O `init_db()` precisa rodar no import do módulo, não só no
+`if __name__ == "__main__"`, porque o gunicorn nunca executa esse bloco. Já está assim.
+
+**4. `UniqueViolation ... pg_type_typname_nsp_index` na subida.**
+Dois workers criando a mesma tabela ao mesmo tempo. É inofensivo e o
+`init_db()` já ignora.
+
+**5. API do BCB devolvendo 400.**
+O endpoint `/dados/ultimos/{n}` passou a dar 400. O código usa `/dados` com
+`dataInicial`/`dataFinal` e recorta os últimos N pontos.
+
+**6. Página carrega para sempre.**
+Era vazamento de conexão (`with conn:` não fecha a conexão). Hoje tem pool
+(`ThreadedConnectionPool`) e `connect_timeout=10`. O free da Aiven aceita no
+máximo 20 conexões; o pool usa até 5.
+
+**7. Render diz "live", mas dá 502 / `No open HTTP ports detected`.**
+Porta do gunicorn diferente da que o Render espera. Com o Dockerfile atual
+(escutando em `$PORT`) isso não deve mais acontecer. Se acontecer, crie
+`PORT=8080` em Environment.
+
+**8. `/healthz` dá erro / deploy não fica verde.**
+Veja o log do serviço no Render. Normalmente é `AIVEN_DB_URL` errada ou sem
+`?sslmode=require`. Confira também se o allowlist de IP do Postgres na Aiven
+permite `0.0.0.0/0`.
+
+**9. `terraform apply` falha com 401/403.**
+Token inválido ou de outro projeto. Gere um novo e confira `AIVEN_PROJECT`.
+
+**10. Workflow não aparece em Actions.**
+O YAML tem que estar exatamente em `.github/workflows/`.
+
+**11. Postgres da Aiven desligado sozinho.**
+A Aiven pode desligar serviço free parado. O `refresh-data.yml` mantém alguma
+atividade a cada 6h. Se desligar mesmo assim, ligue de novo pelo console.
+
+## Diagrama
 
 ```
-ERROR: failed to calculate checksum ... "/requirements.txt": not found
+ push em app/                         Run workflow (manual)
+      │                                       │
+      ▼                                       ▼
+ ┌──────────────────────────┐        ┌──────────────────┐
+ │ ci-cd.yml                │        │ infra.yml        │
+ │ test (Postgres container)│        │ Terraform        │
+ │ → build/push (GHCR)      │        │ → Postgres free  │
+ │ → deploy hook + /healthz │        └────────┬─────────┘
+ └────────────┬─────────────┘                 │
+              ▼                               ▼
+        Render (Docker) ── AIVEN_DB_URL ──▶ Aiven PostgreSQL (SSL)
+              ▲
+              │ POST /api/refresh a cada 6h
+        refresh-data.yml
 ```
-
-Causa: o `Dockerfile` estava em `app/Dockerfile`, mas o **contexto de
-build** do Render (campo "Docker Build Context Directory") apontava para
-a raiz do repositório — então o `COPY requirements.txt .` procurava o
-arquivo em `/requirements.txt`, que não existe (ele está em
-`app/requirements.txt`).
-
-Ajustar o campo "Docker Build Context Directory" para `app` no painel
-pode resolver, mas em alguns testes esse campo **não surtiu efeito** de
-forma consistente (builds seguintes usavam o mesmo contexto de antes,
-mesmo salvando a mudança). A solução mais robusta e que não depende
-desse campo específico: **mover o `Dockerfile` para a raiz do repo** e
-usar `COPY app/requirements.txt .` / `COPY app/ .` — assim o contexto
-padrão (raiz) já é o correto, sem precisar configurar nada extra.
-
-### 2. Build falha mesmo com o Dockerfile "certo"
-
-Se o erro persistir mostrando o **conteúdo antigo** do Dockerfile
-mesmo após você editá-lo, adicione temporariamente um passo de
-diagnóstico que lista o conteúdo do contexto de build:
-
-```dockerfile
-RUN find . -maxdepth 3 -not -path '*/.git*'
-```
-
-No nosso caso, isso revelou que o arquivo `requirements.txt` tinha sido
-commitado com um **espaço no início do nome** (`" requirements.txt"`),
-provavelmente por um erro ao renomear pelo editor web do GitHub — por
-isso o `COPY app/requirements.txt .` nunca encontrava o arquivo, mesmo
-o caminho estando certo. Vale a pena checar nomes de arquivo com espaços
-acidentais sempre que um `COPY` falhar sem motivo aparente.
-
-### 3. Build passa, mas o container crasha: `relation "..." does not exist`
-
-Causa: o código que cria as tabelas (`init_db()`) só rodava dentro de
-`if __name__ == "__main__":`, bloco que **nunca executa** quando o app
-sobe via `gunicorn app:app` (usado em produção). Solução: mover a
-chamada de `init_db()` para o nível do módulo, fora do bloco
-`__main__`, para que rode sempre que o módulo é importado — inclusive
-pelo gunicorn.
-
-### 4. `ModuleNotFoundError: No module named 'bcb_client'`
-
-Mesma causa-raiz do item 2: outro arquivo (`bcb_client.py`, nesse caso)
-também tinha sido commitado com um nome ligeiramente errado. Sempre que
-um `import` falhar apesar do arquivo "existir", confira o nome exato no
-GitHub (não confie só na aparência visual — copie e cole o nome).
-
-### 5. `psycopg2.errors.UniqueViolation: ... pg_type_typname_nsp_index`
-
-Com mais de um worker do gunicorn, todos chamam `init_db()` quase ao
-mesmo tempo na subida. `CREATE TABLE IF NOT EXISTS` não é perfeitamente
-atômico entre transações concorrentes no Postgres, então dois workers
-podem colidir tentando criar a mesma tabela — um deles recebe esse erro,
-que é inofensivo (a tabela já existe). `bcb_client.py` já trata esse
-caso especificamente (ver `init_db()`).
-
-### 6. API do BCB retornando 400 Bad Request
-
-O endpoint `/dados/serie/bcdata.sgs.{codigo}/dados/ultimos/{n}` da API
-do BCB passou a responder 400 em testes recentes. `bcb_client.py` usa o
-endpoint alternativo `/dados` com `dataInicial`/`dataFinal`, que
-funciona normalmente, e recorta os últimos N pontos localmente.
-
-### 7. Página fica carregando pra sempre / demora muito (mas sem erro)
-
-Duas causas possíveis, ambas relacionadas a conexões com o Postgres:
-
-- **Vazamento de conexões**: `with psycopg2_connection:` controla só
-  commit/rollback, **não fecha** a conexão. Sem fechar explicitamente,
-  cada requisição deixava conexões penduradas até estourar o limite do
-  plano da Aiven, e novas conexões passavam a travar. `bcb_client.py`
-  agora usa um **pool de conexões** (`ThreadedConnectionPool`), que
-  reaproveita conexões entre requisições em vez de abrir/fechar uma nova
-  a cada consulta — também deixa o carregamento da página bem mais
-  rápido, já que abrir uma conexão nova custa ~1s (latência de rede até
-  a Aiven + handshake SSL).
-- Sem timeout explícito, uma conexão que trava (rede instável, banco
-  fora do ar) trava o worker inteiro **silenciosamente**, sem nenhum
-  erro no log. `connect_timeout=10` no `psycopg2.connect()` garante que,
-  se isso acontecer, o erro apareça rápido e de forma clara.
-
-### 8. "Your service is live 🎉" no log, mas o navegador dá 502 / fica carregando pra sempre
-
-Esse é o mais sutil: o gunicorn confirma estar escutando em
-`0.0.0.0:8080`, o Render até declara "live", mas nenhuma requisição
-externa chega no container (nem `/healthz`, que só faz uma query
-simples). O log mostra `No open HTTP ports detected on 0.0.0.0,
-continuing to scan...` repetidamente.
-
-Causa: o mecanismo de detecção automática de porta do Render às vezes
-falha em identificar a porta exposta pelo container. A correção
-(confirmada em vários relatos no fórum oficial do Render) é criar
-**manualmente** a variável de ambiente `PORT` em Settings → Environment,
-com o **mesmo valor** que o `CMD` do Dockerfile usa para o
-`--bind 0.0.0.0:PORTA` (`8080` neste projeto). Atenção ao digitar o
-valor — um erro comum é deixar `10000` (sugestão padrão do Render) em
-vez de `8080`, o que causa o mesmo sintoma por um motivo diferente
-(Render escuta na porta errada).
-
-### Checklist rápido se o deploy não sobe
-
-1. O `Dockerfile` está na raiz do repo, e `Docker Build Context
-   Directory` é `.`?
-2. Todos os nomes de arquivo em `app/` estão exatamente certos (sem
-   espaço antes/depois)?
-3. `AIVEN_DB_URL` está preenchida em Settings → Environment?
-4. `PORT=8080` está preenchida em Settings → Environment?
-5. O IP allowlist do Postgres na Aiven permite `0.0.0.0/0` (ou pelo
-   menos os IPs do Render)?
-
-## Possíveis extensões para a turma
-
-- Adicionar um ambiente de *staging* com `workflow_dispatch` manual antes
-  do deploy em produção.
-- Um segundo consumer "fan-out" do mesmo tópico Kafka — por exemplo, um
-  alerta quando o dólar varia mais de 1% num dia, mostrando que múltiplos
-  consumidores podem reagir ao mesmo evento de formas diferentes.
-- Trocar o Aiven for Grafana por **Aiven for OpenSearch**, indexando os
-  eventos do Kafka para busca full-text e análise de logs.
