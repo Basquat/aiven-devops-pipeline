@@ -1,0 +1,6 @@
+.git
+.github
+terraform
+**/__pycache__
+**/.env
+app/test_app.py

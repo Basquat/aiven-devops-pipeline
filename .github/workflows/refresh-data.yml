@@ -1,16 +1,25 @@
 name: Dados - Refresh agendado (BCB)
 
-# Chama o endpoint /api/refresh periodicamente, mesmo sem visitas ao dashboard.
-# Útil para que a primeira visita do dia já encontre dados atualizados.
+# Chama /api/refresh a cada 6h, mesmo sem visitas. Serve pra duas coisas:
+# a primeira visita do dia já pega dado novo, e o Postgres free da Aiven
+# não fica "parado" (a Aiven pode desligar serviço free sem atividade).
 on:
   schedule:
-    - cron: "0 */6 * * *"   # a cada 6 horas
+    - cron: "0 */6 * * *"
   workflow_dispatch:
 
 jobs:
   refresh:
     runs-on: ubuntu-latest
+    env:
+      APP_URL: ${{ secrets.APP_HEALTHCHECK_URL }}
     steps:
       - name: Disparar /api/refresh
         run: |
-          curl -fsS -X POST "${{ secrets.APP_HEALTHCHECK_URL }}/api/refresh"
+          if [ -z "$APP_URL" ]; then
+            echo "::warning::APP_HEALTHCHECK_URL não configurado, nada a fazer"
+            exit 0
+          fi
+          # --retry cobre o cold start do Render free (app dormindo)
+          curl -fsS --retry 5 --retry-delay 20 --retry-all-errors --max-time 60 \
+            -X POST "$APP_URL/api/refresh"
