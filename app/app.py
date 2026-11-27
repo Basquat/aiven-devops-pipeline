@@ -1,13 +1,8 @@
 """
 Dashboard de Indicadores Econômicos — App Flask
-Lê os indicadores do Postgres da Aiven (tabela bcb_series). Os dados chegam
-lá de duas formas possíveis, que podem conviver:
-
-  1. Cache batch: este próprio app busca dados novos na API do BCB quando
-     o cache está velho (ver refresh_stale_series abaixo) — funciona sozinho,
-     sem depender de Kafka.
-  2. Streaming: producer.py publica no Kafka, consumer.py assina o tópico
-     e grava aqui — ver README para a arquitetura completa.
+Lê os indicadores do Postgres da Aiven (tabela bcb_series). Quando o cache
+de uma série fica velho, o próprio app busca dados novos na API do BCB
+(ver refresh_stale_series). Cada acesso fica registrado na tabela visits.
 
 Variáveis de ambiente esperadas (ver .env.example):
   AIVEN_DB_URL   -> string de conexão fornecida pela Aiven
@@ -26,6 +21,7 @@ import bcb_client as bcb
 app = Flask(__name__)
 
 CACHE_HOURS = int(os.environ.get("CACHE_HOURS", 6))
+TZ = os.environ.get("TZ_DISPLAY", "America/Sao_Paulo")
 START_TIME = time.time()
 
 # Garante que as tabelas existam assim que o módulo é carregado — necessário
@@ -56,8 +52,7 @@ def is_cache_stale(series_code: int) -> bool:
 
 
 def refresh_stale_series():
-    """Cache batch: só busca na API do BCB se ninguém (nem o consumer do
-    Kafka) já atualizou essa série recentemente."""
+    """Só busca na API do BCB as séries com cache vencido."""
     for code in bcb.SERIES:
         if is_cache_stale(code):
             try:
@@ -75,12 +70,14 @@ def get_series_data(series_code: int):
                 SELECT ref_date, value
                 FROM bcb_series
                 WHERE series_code = %s
-                ORDER BY ref_date ASC
+                ORDER BY ref_date DESC
                 LIMIT %s;
                 """,
                 (series_code, bcb.POINTS_PER_SERIES),
             )
-            return cur.fetchall()
+            # DESC pega os mais recentes (ASC pegava os 30 mais antigos da
+            # tabela, que só cresce); inverte pra exibir em ordem cronológica.
+            return cur.fetchall()[::-1]
 
 
 def get_dashboard_data():
@@ -112,12 +109,42 @@ def get_dashboard_data():
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) AS total FROM visits;")
             total_visits = cur.fetchone()["total"]
+            cur.execute(
+                """
+                SELECT to_char(m, 'HH24:MI') AS minute, total
+                FROM (
+                    SELECT date_trunc('minute', created_at AT TIME ZONE %s) AS m,
+                           COUNT(*) AS total
+                    FROM visits
+                    WHERE created_at > now() - interval '30 minutes'
+                    GROUP BY m
+                ) t
+                ORDER BY m;
+                """,
+                (TZ,),
+            )
+            per_minute = cur.fetchall()
+            cur.execute(
+                """
+                SELECT path, to_char(created_at AT TIME ZONE %s, 'DD/MM HH24:MI:SS') AS at
+                FROM visits
+                ORDER BY id DESC
+                LIMIT 10;
+                """,
+                (TZ,),
+            )
+            recent_visits = cur.fetchall()
 
     return {
         "indicators": indicators,
         "total_visits": total_visits,
+        "visits_per_minute": {
+            "labels": [r["minute"] for r in per_minute],
+            "values": [r["total"] for r in per_minute],
+        },
+        "recent_visits": recent_visits,
         "uptime_seconds": int(time.time() - START_TIME),
-        "server_time": datetime.datetime.utcnow().isoformat() + "Z",
+        "server_time": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "cache_hours": CACHE_HOURS,
     }
 
@@ -150,14 +177,19 @@ def api_refresh():
 
 @app.route("/healthz")
 def healthz():
-    """Usado pelo pipeline de CI/CD e pela plataforma de deploy (health check)."""
+    """Usado pelo pipeline de CI/CD e pelo health check do Render.
+
+    `commit` vem do RENDER_GIT_COMMIT (o Render preenche sozinho): o CI usa
+    pra saber se a versão nova já está no ar, e não a anterior."""
     try:
         with bcb.get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1;")
-        return jsonify({"status": "ok"}), 200
-    except Exception as exc:  # noqa: BLE001
-        return jsonify({"status": "error", "detail": str(exc)}), 503
+        return jsonify({"status": "ok", "commit": os.environ.get("RENDER_GIT_COMMIT")}), 200
+    except Exception:  # noqa: BLE001
+        # Detalhe só no log: a mensagem do psycopg2 expõe host/usuário do banco.
+        app.logger.exception("healthz: falha ao consultar o banco")
+        return jsonify({"status": "error"}), 503
 
 
 if __name__ == "__main__":

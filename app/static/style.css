@@ -41,6 +41,13 @@ header h1 { margin-bottom: 0.2rem; }
   margin-bottom: 1.5rem;
 }
 
+.chart-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 1.5rem;
+}
+.chart-grid h3 { font-size: 0.9rem; color: #9a9ac0; font-weight: 500; margin: 0 0 0.5rem; }
+
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 0.5rem; border-bottom: 1px solid #2c2f52; }
 th { color: #9a9ac0; font-weight: 600; }

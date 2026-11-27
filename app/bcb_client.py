@@ -1,7 +1,6 @@
 """
 Módulo compartilhado: conexão com o Postgres da Aiven e leitura da API
-de dados abertos do Banco Central (SGS). Usado por app.py, producer.py
-e consumer.py — evita duplicar a lógica de acesso a dados em cada script.
+de dados abertos do Banco Central (SGS).
 """
 
 import os
@@ -11,15 +10,23 @@ import psycopg2
 from psycopg2 import pool as psycopg2_pool
 from psycopg2.extras import RealDictCursor
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 DB_URL = os.environ.get("AIVEN_DB_URL")
+
+# A API do BCB às vezes derruba a conexão ou devolve 5xx do nada; tentar de
+# novo 1-2s depois quase sempre resolve.
+_http = requests.Session()
+_http.mount("https://", HTTPAdapter(max_retries=Retry(
+    total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])))
 
 # Séries do SGS/BCB — dados abertos, sem autenticação.
 # Referência completa de códigos: https://www3.bcb.gov.br/sgspub
 SERIES = {
     1:   {"name": "Dólar comercial (venda)", "unit": "R$", "casas": 4},
     432: {"name": "Meta Selic definida pelo Copom", "unit": "% a.a.", "casas": 2},
-    433: {"name": "IPCA - variação mensal", "unit": "%", "casas": 2},
+    433: {"name": "IPCA - variação mensal", "unit": "%", "casas": 2, "mensal": True},
 }
 POINTS_PER_SERIES = 30
 
@@ -41,7 +48,8 @@ def _get_pool():
             minconn=1,
             maxconn=5,
             dsn=DB_URL,
-            sslmode="require",
+            # A Aiven exige SSL. DB_SSLMODE só existe pro Postgres local do CI.
+            sslmode=os.environ.get("DB_SSLMODE", "require"),
             cursor_factory=RealDictCursor,
             connect_timeout=10,
         )
@@ -120,7 +128,9 @@ def fetch_series_from_bcb(series_code: int, n: int = POINTS_PER_SERIES):
     isso usamos aqui o endpoint padrão com `dataInicial`/`dataFinal`, que
     funciona normalmente, e pegamos só os últimos N pontos retornados.
     """
-    days_back = n * 3  # margem folgada: nem todo dia tem valor (fins de semana, feriados etc.)
+    # Margem folgada: série diária não tem valor em fim de semana/feriado, e a
+    # mensal tem um ponto por mês (com n*3 dias o IPCA vinha com só 3 pontos).
+    days_back = n * (31 if SERIES.get(series_code, {}).get("mensal") else 3)
     today = datetime.date.today()
     start = today - datetime.timedelta(days=days_back)
 
@@ -130,7 +140,7 @@ def fetch_series_from_bcb(series_code: int, n: int = POINTS_PER_SERIES):
         "dataInicial": start.strftime("%d/%m/%Y"),
         "dataFinal": today.strftime("%d/%m/%Y"),
     }
-    resp = requests.get(url, params=params, timeout=10)
+    resp = _http.get(url, params=params, timeout=10)
     resp.raise_for_status()
     raw = resp.json()  # [{"data": "27/08/2026", "valor": "5.3521"}, ...]
 
@@ -142,8 +152,7 @@ def fetch_series_from_bcb(series_code: int, n: int = POINTS_PER_SERIES):
 
 
 def upsert_series(series_code: int, points: list):
-    """Grava (ou atualiza) pontos de uma série direto no Postgres —
-    usado tanto pelo cache do app.py quanto pelo consumer.py do Kafka."""
+    """Grava (ou atualiza) pontos de uma série no Postgres."""
     with get_connection() as conn:
         with conn.cursor() as cur:
             for p in points:
