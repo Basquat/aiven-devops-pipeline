@@ -1,11 +1,8 @@
 name: Infra - Provisionar Aiven (Terraform)
 
-# Roda só quando algo em /terraform muda, ou manualmente pelo botão "Run workflow"
+# Só manual (botão "Run workflow"), como na Etapa 5 do guia. Não roda em push
+# pra ninguém provisionar/alterar infra sem querer.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "terraform/**"
   workflow_dispatch:
 
 env:
@@ -23,6 +20,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Conferir secrets
+        run: |
+          if [ -z "$TF_VAR_aiven_api_token" ] || [ -z "$TF_VAR_aiven_project" ]; then
+            echo "::error::Cadastre AIVEN_API_TOKEN e AIVEN_PROJECT em Settings > Secrets and variables > Actions"
+            exit 1
+          fi
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
@@ -31,8 +35,19 @@ jobs:
       - name: Terraform Init
         run: terraform init
 
+      - name: Terraform Format
+        run: terraform fmt -check -diff
+
       - name: Terraform Validate
         run: terraform validate
+
+      # O state não é guardado entre execuções (ver main.tf). Se o serviço já
+      # existe na Aiven, importa pro state antes do plan. Na primeira vez o
+      # import falha porque ainda não tem nada lá, e tudo bem.
+      - name: Importar serviço existente
+        run: |
+          terraform import aiven_pg.dashboard_db "$TF_VAR_aiven_project/dashboard-pg" \
+            || echo "dashboard-pg ainda não existe, será criado"
 
       - name: Terraform Plan
         run: terraform plan -out=tfplan
@@ -41,6 +56,6 @@ jobs:
         if: github.ref == 'refs/heads/main'
         run: terraform apply -auto-approve tfplan
 
-      - name: Exportar URI de conexão (para inspeção manual, se necessário)
+      - name: Host do Postgres
         if: github.ref == 'refs/heads/main'
         run: terraform output -raw pg_host
